@@ -2,6 +2,7 @@ import copy
 from dataclasses import dataclass
 from typing import Iterable, Optional, Union
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -25,19 +26,40 @@ class TDMPC2Config:
     latent_dim: int = 512
 
     num_bins: int = 101
+    vmin: int = -10
+    vmax: int = +10
 
     num_Qs: int = 5
 
     pi_log_std_min: float = -10
     pi_log_std_max: float = 2
 
+    discount_factor_min: float = 0.95
+    discount_factor_max: float = 0.995
+    discount_factor_denom: int = 5
+
+    episode_length: int = 1000
+
     temporal_decay_coeff: float = 0.5
+
+    consistency_coeff: float = 20
+    reward_coeff: float = 0.1
+    q_value_coeff: float = 0.1
 
 class TDMPC2Policy(nn.Module):
     def __init__(self, config: TDMPC2Config):
         super().__init__()
         self.config = config
         self.model = TDMPC2TOLD(config = config)
+
+    def _discount_factor(config: TDMPC2Config) -> Tensor:
+        """
+        Returns discount factor for a given episode length.
+        Simple heuristic that scales discount linearly with episode length.
+        Default values should work well for most tasks, but can be changed as needed.
+        """
+        frac = config.episode_length / config.discount_factor_denom
+        return min(max((frac - 1) / (frac), config.discount_factor_min), config.discount_factor_max)
 
     def forward(self, batch: dict[str, Tensor]):
         device = get_device_from_parameters(self)
@@ -48,7 +70,7 @@ class TDMPC2Policy(nn.Module):
         actions = batch['actions']
         reward = batch['reward']
 
-        horizon, batch_size = next_observations[:2]
+        horizon, batch_size = next_observations.shape[:2]
         
         # Run latent rollout using the latent dynamics model and policy model.
         # Note this has shape `horizon+1` because there are `horizon` actions and a current `z`. Each action
@@ -68,30 +90,55 @@ class TDMPC2Policy(nn.Module):
         with torch.no_grad():
             # Latent state consistency targets.
             z_targets = self.model.encode(next_observations)
-            # TODO: Implement discount factor.
-            discount = 1
-            pi = self.model.pi(z_targets)
-            # TODO: Implement Q target computation.
-            q_targets = reward + discount * self.model.Qs(z_targets, pi)
+            pi = self.model.pi(z_targets)[0]
+            q_targets = self.model.Qs_target(z_targets, pi)
+            q1_target, q2_target = q_targets[np.random.choice(self.config.num_Qs, 2, replace=False)]
+            q1_target, q2_target = math_utils.two_hot_inv(q1_target, self.config), math_utils.two_hot_inv(q2_target, self.config)
+            q_targets = reward + TDMPC2Policy._discount_factor(self.config) * torch.min(q1_target, q2_target)
 
         # Compute losses.
         # Exponentially decay the loss weight with respect to the timestep. Steps that are more distant in the
         # future have less impact on the loss. Note: unsqueeze will let us broadcast to (seq, batch).
-        # temporal_loss_coeffs = torch.pow(
-        #     self.config.temporal_decay_coeff, torch.arange(horizon, device=device)
-        # ).unsqueeze(-1)
+        temporal_loss_coeffs = torch.pow(self.config.temporal_decay_coeff, torch.arange(horizon, device=device)).unsqueeze(-1)
 
-        # TODO: Check if need padding.
+        # Compute consistency loss as MSE loss between latents predicted from the rollout and latents
+        # predicted from the (target model's) observation encoder.
+        consistency_loss = (
+            (
+                temporal_loss_coeffs *
+                F.mse_loss(z_preds[1:], z_targets, reduction="none").mean(dim=-1)
+            )
+            .sum(0)
+            .mean()
+        ) * 1 / horizon
+
         # Compute the reward loss as MSE loss between rewards predicted from the rollout and the dataset
         # rewards.
-        # reward_loss = (
-        #     (
-        #         temporal_loss_coeffs
-        #         * F.mse_loss(reward_preds, reward, reduction="none")
-        #     )
-        #     .sum(0)
-        #     .mean()
-        # )
+        reward_loss = (
+            (
+                temporal_loss_coeffs
+                * math_utils.ce_loss(reward_preds, math_utils.two_hot(reward, self.config)).mean(dim=-1)
+            )
+            .sum(0)
+            .mean()
+        ) * 1 / horizon
+        
+        # Compute state-action value loss (TD loss) for all of the Q functions in the ensemble.
+        q_value_loss = (
+            (
+                temporal_loss_coeffs.repeat(self.config.num_Qs, 1)
+                * math_utils.ce_loss(q_preds, math_utils.two_hot(q_targets, self.config).unsqueeze(0).expand(5, -1, -1, -1)).mean(dim=-1).view(self.config.num_Qs * horizon, -1)
+            )
+            .sum(0)
+            .mean()
+        ) * 1 / (horizon + self.config.num_Qs)
+
+        loss = (
+            self.config.consistency_coeff * consistency_loss
+            + self.config.reward_coeff * reward_loss
+            + self.config.q_value_coeff * q_value_loss
+        )
+
 
 class TDMPC2TOLD(nn.Module):
     def __init__(self, config: TDMPC2Config):
@@ -116,6 +163,7 @@ class TDMPC2TOLD(nn.Module):
             )
             for _ in range(config.num_Qs)
         ])
+        self._Qs_target = copy.deepcopy(self._Qs).requires_grad_(False)
         self._pi = nn.Sequential(
             NormedLinear(config.latent_dim, config.mlp_hidden_dim, act = nn.Mish(inplace = True)),
             NormedLinear(config.mlp_hidden_dim, config.mlp_hidden_dim, act = nn.Mish(inplace = True)),
@@ -136,6 +184,10 @@ class TDMPC2TOLD(nn.Module):
     def Qs(self, z: Tensor, a: Tensor) -> Tensor:
         x = torch.cat([z, a], dim=-1)
         return self._Qs(x)
+    
+    def Qs_target(self, z: Tensor, a: Tensor) -> Tensor:
+        x = torch.cat([z, a], dim=-1)
+        return self._Qs_target(x)
 
     def pi(self, z: Tensor) -> Union[Tensor, Tensor, Tensor, Tensor]:
         mu, log_std = self._pi(z).chunk(2, dim=-1)
