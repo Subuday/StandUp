@@ -176,7 +176,7 @@ class TDMPC2TOLD(nn.Module):
         )
         self._Qs = VectorizedModuleList([
             nn.Sequential(
-                NormedLinear(config.latent_dim + config.action_dim, config.mlp_hidden_dim, act = nn.Mish(inplace = True)),
+                NormedLinear(config.latent_dim + config.action_dim, config.mlp_hidden_dim, act = nn.Mish(inplace = True), dropout = 0.01),
                 NormedLinear(config.mlp_hidden_dim, config.mlp_hidden_dim, act = nn.Mish(inplace = True)),
                 nn.Linear(config.mlp_hidden_dim, config.num_bins, bias = True)
             )
@@ -225,9 +225,9 @@ class TDMPC2TOLD(nn.Module):
 class TDMPC2ObservationEncoder(nn.Module):
     def __init__(self, config: TDMPC2Config):
         super().__init__()
-        self.state = nn.Sequential(*TDMPC2ObservationEncoder._create_layers(config))
+        self.state = nn.Sequential(*TDMPC2ObservationEncoder._create_state(config))
 
-    def _create_layers(config: TDMPC2Config) -> nn.ModuleList:
+    def _create_state(config: TDMPC2Config) -> nn.ModuleList:
         layers = nn.ModuleList()
         layers.append(NormedLinear(config.observation_dim, config.encoder_hidden_dim, act = nn.Mish(inplace = True)))
         for _ in range(config.encoder_num_layers - 2):
@@ -236,7 +236,7 @@ class TDMPC2ObservationEncoder(nn.Module):
         return layers
     
     def forward(self, x: Tensor) -> Tensor:
-        return self.layers(x) 
+        return self.state(x)
 
 class NormedLinear(nn.Linear):
     def __init__(self, *args, act, dropout = None, **kwargs):
