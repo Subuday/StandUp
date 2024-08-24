@@ -7,21 +7,24 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
+from functorch import combine_state_for_ensemble
 
 import math_utils
 from utils import get_device_from_parameters
 
 @dataclass
 class TDMPC2Config:
-    input_dim: int = 51
-    action_dim: int = 19
+    checkpoint: str = "./cup-spin.pt"
+    
+    observation_dim: int = 8
+    action_dim: int = 2
 
     simplex_dim: int = 8
 
     encoder_hidden_dim: int = 256
     encoder_num_layers: int = 2
 
-    mlp_hidden_dim: int = 256
+    mlp_hidden_dim: int = 512
 
     latent_dim: int = 512
 
@@ -52,6 +55,7 @@ class TDMPC2Policy(nn.Module):
         self.config = config
         self.model = TDMPC2TOLD(config = config)
 
+    @staticmethod
     def _discount_factor(config: TDMPC2Config) -> Tensor:
         """
         Returns discount factor for a given episode length.
@@ -60,6 +64,21 @@ class TDMPC2Policy(nn.Module):
         """
         frac = config.episode_length / config.discount_factor_denom
         return min(max((frac - 1) / (frac), config.discount_factor_min), config.discount_factor_max)
+    
+
+    def load(self, file_path: str):
+        dict = torch.load(file_path, weights_only=True)["model"]
+        new_keys = []
+
+        for key in dict.keys():
+            if "_target_Qs" in key:
+                new_keys.append((key, key.replace("_target_Qs", "_Qs_target")))
+
+        for old_key, new_key in new_keys:
+            dict[new_key] = dict.pop(old_key)
+        
+        self.model.load_state_dict(dict)
+
 
     def forward(self, batch: dict[str, Tensor]):
         device = get_device_from_parameters(self)
@@ -206,11 +225,11 @@ class TDMPC2TOLD(nn.Module):
 class TDMPC2ObservationEncoder(nn.Module):
     def __init__(self, config: TDMPC2Config):
         super().__init__()
-        self.layers = nn.Sequential(*TDMPC2ObservationEncoder._create_layers(config))
+        self.state = nn.Sequential(*TDMPC2ObservationEncoder._create_layers(config))
 
     def _create_layers(config: TDMPC2Config) -> nn.ModuleList:
         layers = nn.ModuleList()
-        layers.append(NormedLinear(config.input_dim, config.encoder_hidden_dim, act = nn.Mish(inplace = True)))
+        layers.append(NormedLinear(config.observation_dim, config.encoder_hidden_dim, act = nn.Mish(inplace = True)))
         for _ in range(config.encoder_num_layers - 2):
             layers.append(NormedLinear(config.encoder_hidden_dim, config.encoder_hidden_dim, act = nn.Mish(inplace = True)))
         layers.append(NormedLinear(config.encoder_hidden_dim, config.latent_dim, act = SimNorm(V = config.simplex_dim)))
@@ -244,15 +263,12 @@ class SimNorm(nn.Module):
         return x.view(*shape)
     
 class VectorizedModuleList(nn.Module):
-    def __init__(self, modules: Optional[Iterable[nn.Module]]):
+    def __init__(self, modules: Optional[Iterable[nn.Module]], **kwargs):
         super().__init__()
-        self.base_model = copy.deepcopy(modules[0]).to("meta")
-        self.modules = nn.ModuleList(modules)
-        self.params, self.buffers = torch.func.stack_module_state(modules)
-        self.vmap = torch.vmap(self._call_single_model, in_dims=(0, 0, None), randomness="different")
+        modules = nn.ModuleList(modules)
+        fn, params, _ = combine_state_for_ensemble(modules)
+        self.vmap = torch.vmap(fn, in_dims=(0, 0, None), randomness="different", **kwargs)
+        self.params = nn.ParameterList([nn.Parameter(p) for p in params])
 
-    def _call_single_model(self, params, buffers, *args):
-        return torch.func.functional_call(self.base_model, (params, buffers), args)
-    
-    def forward(self, *args):
-        return self.vmap(self.params, (self.buffers), *args)
+    def forward(self, *args, **kwargs):
+        return self.vmap([p for p in self.params], (), *args, **kwargs)
