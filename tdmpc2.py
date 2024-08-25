@@ -2,6 +2,7 @@ import copy
 from dataclasses import dataclass
 from typing import Iterable, Optional, Union
 
+import einops
 import numpy as np
 import torch
 import torch.nn as nn
@@ -14,10 +15,25 @@ from utils import get_device_from_parameters
 
 @dataclass
 class TDMPC2Config:
-    checkpoint: str = "./cup-spin.pt"
+    checkpoint: str = "./dog-run.pt"
+    seed: int = 1234
+
+    horizon: int = 5
+
+    # Inference.
+    use_mpc: bool = True
+    cem_iterations: int = 6
+    max_std: float = 2.0
+    min_std: float = 0.05
+    n_gaussian_samples: int = 512
+    n_pi_samples: int = 51
+    n_elites: int = 64
+    elite_weighting_temperature: float = 0.5
+
+    eval_episodes: int = 100
     
-    observation_dim: int = 8
-    action_dim: int = 2
+    observation_dim: int = 223
+    action_dim: int = 38
 
     simplex_dim: int = 8
 
@@ -54,6 +70,7 @@ class TDMPC2Policy(nn.Module):
         super().__init__()
         self.config = config
         self.model = TDMPC2TOLD(config = config)
+        self.reset()
 
     @staticmethod
     def _discount_factor(config: TDMPC2Config) -> Tensor:
@@ -65,6 +82,8 @@ class TDMPC2Policy(nn.Module):
         frac = config.episode_length / config.discount_factor_denom
         return min(max((frac - 1) / (frac), config.discount_factor_min), config.discount_factor_max)
     
+    def reset(self):
+        self._prev_mean: torch.Tensor | None = None
 
     def load(self, file_path: str):
         dict = torch.load(file_path, weights_only=True)["model"]
@@ -78,6 +97,109 @@ class TDMPC2Policy(nn.Module):
             dict[new_key] = dict.pop(old_key)
         
         self.model.load_state_dict(dict)
+
+
+    @torch.no_grad()
+    def select_action(self, observation: Tensor) -> Tensor:
+        z = self.model.encode(observation)
+        assert self.config.use_mpc
+        return self.plan(z)
+    
+
+    @torch.no_grad()
+    def plan(self, z: Tensor):
+        device = get_device_from_parameters(self)
+        
+        batch_size = z.shape[0]
+        
+        # Sample Nπ trajectories from the policy.
+        pi_actions = torch.empty(
+            self.config.horizon,
+            self.config.n_pi_samples,
+            batch_size,
+            self.config.action_dim,
+            device=device,
+        )
+        if self.config.n_pi_samples > 0:
+            _z = einops.repeat(z, "b d -> n b d", n = self.config.n_pi_samples)
+            for t in range(self.config.horizon):
+                # Note: Adding a small amount of noise here doesn't hurt during inference and may even be
+                # helpful for CEM.
+                pi_actions[t] = self.model.pi(_z)[0]
+                _z = self.model.latent_dynamics(_z, pi_actions[t])
+
+        # In the CEM loop we will need this for a call to estimate_value with the gaussian sampled
+        # trajectories.
+        z = einops.repeat(z, "b d -> n b d", n=self.config.n_gaussian_samples)
+
+        # Model Predictive Path Integral (MPPI) with the cross-entropy method (CEM) as the optimization
+        # algorithm.
+        # The initial mean and standard deviation for the cross-entropy method (CEM).
+        mean = torch.zeros(self.config.horizon, batch_size, self.config.action_dim, device=device)
+        # Maybe warm start CEM with the mean from the previous step.
+        if self._prev_mean is not None:
+            mean[:-1] = self._prev_mean[1:]
+        std = self.config.max_std * torch.ones_like(mean)
+
+        for _ in range(self.config.cem_iterations):
+            # Randomly sample action trajectories for the gaussian distribution.
+            std_normal_noise = torch.randn(
+                self.config.horizon,
+                self.config.n_gaussian_samples - self.config.n_pi_samples,
+                batch_size,
+                self.config.action_dim,
+                device=std.device,
+            )
+            gaussian_actions = torch.clamp(mean.unsqueeze(1) + std.unsqueeze(1) * std_normal_noise, -1, 1)
+
+            # Compute elite actions.
+            actions = torch.cat([gaussian_actions, pi_actions], dim = 1)
+            value = self.estimate_value(z, actions).nan_to_num_(0)
+            elite_idxs = torch.topk(value, self.config.n_elites, dim=0).indices  # (n_elites, batch)
+            elite_value = value.take_along_dim(elite_idxs, dim=0) # (n_elites, batch)
+            elite_idxs = elite_idxs.squeeze(-1)
+            elite_value = elite_value.squeeze(-1)
+            # (horizon, n_elites, batch, action_dim)
+            elite_actions = actions.take_along_dim(einops.rearrange(elite_idxs, "n b -> 1 n b 1"), dim = 1) 
+            
+            # Update gaussian PDF parameters to be the (weighted) mean and standard deviation of the elites.
+            max_value = elite_value.max(0, keepdim=True)[0]
+            score = torch.exp(self.config.elite_weighting_temperature * (elite_value - max_value))
+            score /= score.sum(axis=0, keepdim=True)
+            mean = torch.sum(einops.rearrange(score, "n b -> n b 1") * elite_actions, dim = 1)
+            std = torch.sqrt(
+                torch.sum(
+                    einops.rearrange(score, "n b -> n b 1")
+                    * (elite_actions - einops.rearrange(mean, "h b d -> h 1 b d")) ** 2,
+                    dim=1,
+                )
+            ).clamp_(self.config.min_std, self.config.max_std)
+
+        score = score.squeeze(1).cpu().numpy()
+        actions = elite_actions[:, np.random.choice(np.arange(score.shape[0]), p=score)]
+        self._prev_mean = mean
+        action = actions[0]
+        return action.clamp(-1, 1)
+
+
+    @torch.no_grad()
+    def estimate_value(self, z: Tensor, actions: Tensor) -> Tensor:
+        """Estimates the value of a trajectory as per eqn 4 of the FOWM paper."""
+        # Initialize return and running discount factor.
+        G, running_discount = 0, 1
+        # Iterate over the actions in the trajectory to simulate the trajectory using the latent dynamics
+        # model. Keep track of return.
+        for t in range(self.config.horizon):
+            reward = self.model.reward(z, actions[t])
+            reward = math_utils.two_hot_inv(reward, self.config)
+            G += running_discount * reward
+            running_discount *= TDMPC2Policy._discount_factor(self.config)
+        pi = self.model.pi(z)[0]
+        q = self.model.Qs(z, pi)
+        q1, q2 = q[np.random.choice(self.config.num_Qs, 2, replace=False)]
+        q1, q2 = math_utils.two_hot_inv(q1, self.config), math_utils.two_hot_inv(q2, self.config)
+        q = (q1 + q2) / 2
+        return G + running_discount * q
 
 
     def forward(self, batch: dict[str, Tensor]):
