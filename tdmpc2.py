@@ -10,7 +10,7 @@ import torch.nn.functional as F
 from torch import Tensor
 from functorch import combine_state_for_ensemble
 
-import math_utils
+from common import math
 from utils import get_device_from_parameters
 
 @dataclass
@@ -193,13 +193,14 @@ class TDMPC2Policy(nn.Module):
         # model. Keep track of return.
         for t in range(self.config.horizon):
             reward = self.model.reward(z, actions[t])
-            reward = math_utils.two_hot_inv(reward, self.config)
+            reward = math.two_hot_inv(reward, self.config)
+            z = self.model.latent_dynamics(z, actions[t])
             G += running_discount * reward
             running_discount *= TDMPC2Policy._discount_factor(self.config)
         pi = self.model.pi(z)[0]
         q = self.model.Qs(z, pi)
         q1, q2 = q[np.random.choice(self.config.num_Qs, 2, replace=False)]
-        q1, q2 = math_utils.two_hot_inv(q1, self.config), math_utils.two_hot_inv(q2, self.config)
+        q1, q2 = math.two_hot_inv(q1, self.config), math.two_hot_inv(q2, self.config)
         q = (q1 + q2) / 2
         return G + running_discount * q
 
@@ -338,12 +339,14 @@ class TDMPC2TOLD(nn.Module):
         device = get_device_from_parameters(self)
         pi_log_std_min = torch.tensor(self.config.pi_log_std_min, device=device)
         pi_log_std_max = torch.tensor(self.config.pi_log_std_max, device=device)
+        pi_log_std_diff = pi_log_std_max - pi_log_std_min
 
-        log_std = math_utils.log_std(log_std, pi_log_std_min, pi_log_std_max)
+        log_std = math.log_std(log_std, pi_log_std_min, pi_log_std_diff)
         eps = torch.randn_like(mu)
-        log_pi = math_utils.gaussian_logprob(eps, log_std)
+        log_pi = math.gaussian_logprob(eps, log_std)
         pi = mu + eps * torch.exp(log_std)
-        mu, pi, log_pi = math_utils.squash(mu, pi, log_pi)
+        mu, pi, log_pi = math.squash(mu, pi, log_pi)
+
         return pi, log_pi, mu, log_std
 
 class TDMPC2ObservationEncoder(nn.Module):
