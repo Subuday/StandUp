@@ -16,24 +16,26 @@ from utils import get_device_from_parameters
 @dataclass
 class TDMPC2Config:
     checkpoint: str = "./dog-run.pt"
-    seed: int = 1234
+    seed: int = 1
 
-    horizon: int = 5
+    horizon: int = 3
+    
+    # Environment
+    action_dim: int = 38
 
     # Inference.
     use_mpc: bool = True
-    cem_iterations: int = 6
+    cem_iterations: int = 10
     max_std: float = 2.0
     min_std: float = 0.05
     n_gaussian_samples: int = 512
-    n_pi_samples: int = 51
+    n_pi_samples: int = 24
     n_elites: int = 64
     elite_weighting_temperature: float = 0.5
 
     eval_episodes: int = 100
     
     observation_dim: int = 223
-    action_dim: int = 38
 
     simplex_dim: int = 8
 
@@ -57,7 +59,7 @@ class TDMPC2Config:
     discount_factor_max: float = 0.995
     discount_factor_denom: int = 5
 
-    episode_length: int = 1000
+    episode_length: int = 500
 
     temporal_decay_coeff: float = 0.5
 
