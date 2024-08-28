@@ -2,6 +2,7 @@ from collections import deque, defaultdict
 from typing import Any, NamedTuple
 import dm_env
 import numpy as np
+import torch
 from dm_control import suite
 suite.ALL_TASKS = suite.ALL_TASKS + suite._get_tasks('custom')
 suite.TASKS_BY_DOMAIN = suite._get_tasks_by_domain(suite.ALL_TASKS)
@@ -177,6 +178,41 @@ class TimeStepToGymWrapper:
 		return self.env.physics.render(height, width, camera_id)
 
 
+class TensorWrapper(gym.Wrapper):
+	"""
+	Wrapper for converting numpy arrays to torch tensors.
+	"""
+
+	def __init__(self, env):
+		super().__init__(env)
+	
+	def rand_act(self):
+		return torch.from_numpy(self.action_space.sample().astype(np.float32))
+
+	def _try_f32_tensor(self, x):
+		x = torch.from_numpy(x)
+		if x.dtype == torch.float64:
+			x = x.float()
+		return x
+
+	def _obs_to_tensor(self, obs):
+		if isinstance(obs, dict):
+			for k in obs.keys():
+				obs[k] = self._try_f32_tensor(obs[k])
+		else:
+			obs = self._try_f32_tensor(obs)
+		return obs
+
+	def reset(self, task_idx=None):
+		return self._obs_to_tensor(self.env.reset())
+
+	def step(self, action):
+		obs, reward, done, info = self.env.step(action.cpu().numpy())
+		info = defaultdict(float, info)
+		info['success'] = float(info['success'])
+		return self._obs_to_tensor(obs), torch.tensor(reward, dtype=torch.float32), done, info
+
+
 def make_env(cfg):
 	"""
 	Make DMControl environment.
@@ -196,4 +232,5 @@ def make_env(cfg):
 	env = action_scale.Wrapper(env, minimum=-1., maximum=1.)
 	env = ExtendedTimeStepWrapper(env)
 	env = TimeStepToGymWrapper(env, domain, task)
+	env = TensorWrapper(env)
 	return env
