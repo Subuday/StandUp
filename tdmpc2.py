@@ -100,44 +100,40 @@ class TDMPC2Policy(nn.Module):
         
         self.model.load_state_dict(dict)
 
-
     @torch.no_grad()
     def select_action(self, observation: Tensor) -> Tensor:
         z = self.model.encode(observation)
         assert self.config.use_mpc
         return self.plan(z)
     
-
     @torch.no_grad()
     def plan(self, z: Tensor):
         device = get_device_from_parameters(self)
-        
-        batch_size = z.shape[0]
         
         # Sample Nπ trajectories from the policy.
         pi_actions = torch.empty(
             self.config.horizon,
             self.config.n_pi_samples,
-            batch_size,
             self.config.action_dim,
             device=device,
         )
         if self.config.n_pi_samples > 0:
-            _z = einops.repeat(z, "b d -> n b d", n = self.config.n_pi_samples)
-            for t in range(self.config.horizon):
+            _z = einops.repeat(z, "1 d -> n d", n = self.config.n_pi_samples)
+            for t in range(self.config.horizon - 1):
                 # Note: Adding a small amount of noise here doesn't hurt during inference and may even be
                 # helpful for CEM.
                 pi_actions[t] = self.model.pi(_z)[0]
                 _z = self.model.latent_dynamics(_z, pi_actions[t])
+            pi_actions[-1] = self.model.pi(_z)[0]
 
         # In the CEM loop we will need this for a call to estimate_value with the gaussian sampled
         # trajectories.
-        z = einops.repeat(z, "b d -> n b d", n=self.config.n_gaussian_samples)
+        z = einops.repeat(z, "1 d -> n d", n=self.config.n_gaussian_samples)
 
         # Model Predictive Path Integral (MPPI) with the cross-entropy method (CEM) as the optimization
         # algorithm.
         # The initial mean and standard deviation for the cross-entropy method (CEM).
-        mean = torch.zeros(self.config.horizon, batch_size, self.config.action_dim, device=device)
+        mean = torch.zeros(self.config.horizon, self.config.action_dim, device=device)
         # Maybe warm start CEM with the mean from the previous step.
         if self._prev_mean is not None:
             mean[:-1] = self._prev_mean[1:]
@@ -148,42 +144,36 @@ class TDMPC2Policy(nn.Module):
             std_normal_noise = torch.randn(
                 self.config.horizon,
                 self.config.n_gaussian_samples - self.config.n_pi_samples,
-                batch_size,
                 self.config.action_dim,
-                device=std.device,
+                device = device,
             )
             gaussian_actions = torch.clamp(mean.unsqueeze(1) + std.unsqueeze(1) * std_normal_noise, -1, 1)
 
             # Compute elite actions.
-            actions = torch.cat([gaussian_actions, pi_actions], dim = 1)
+            actions = torch.cat([pi_actions, gaussian_actions], dim = 1)
             value = self.estimate_value(z, actions).nan_to_num_(0)
-            elite_idxs = torch.topk(value, self.config.n_elites, dim=0).indices  # (n_elites, batch)
-            elite_value = value.take_along_dim(elite_idxs, dim=0) # (n_elites, batch)
-            elite_idxs = elite_idxs.squeeze(-1)
-            elite_value = elite_value.squeeze(-1)
-            # (horizon, n_elites, batch, action_dim)
-            elite_actions = actions.take_along_dim(einops.rearrange(elite_idxs, "n b -> 1 n b 1"), dim = 1) 
+            elite_idxs = torch.topk(value.squeeze(1), self.config.n_elites, dim=0).indices
+            elite_value = value[elite_idxs]
+            elite_actions = actions[:, elite_idxs]
             
             # Update gaussian PDF parameters to be the (weighted) mean and standard deviation of the elites.
-            max_value = elite_value.max(0, keepdim=True)[0]
+            max_value = elite_value.max(0)[0]
             score = torch.exp(self.config.elite_weighting_temperature * (elite_value - max_value))
-            score /= score.sum(axis=0, keepdim=True)
-            mean = torch.sum(einops.rearrange(score, "n b -> n b 1") * elite_actions, dim = 1)
+            score /= score.sum(axis=0)
+            mean = torch.sum(score.unsqueeze(0) * elite_actions, dim = 1) / (score.sum(0) + 1e-9)
             std = torch.sqrt(
-                torch.sum(
-                    einops.rearrange(score, "n b -> n b 1")
-                    * (elite_actions - einops.rearrange(mean, "h b d -> h 1 b d")) ** 2,
-                    dim=1,
-                )
+                torch.sum(score.unsqueeze(0) * (elite_actions - mean.unsqueeze(1)) ** 2, dim=1) / (score.sum(0) + 1e-9)
             ).clamp_(self.config.min_std, self.config.max_std)
 
+        self._prev_mean = mean
+        
         score = score.squeeze(1).cpu().numpy()
         actions = elite_actions[:, np.random.choice(np.arange(score.shape[0]), p=score)]
-        self._prev_mean = mean
-        action = actions[0]
+        action, std = actions[0], std[0]
+        if not self.training:
+            action += std * torch.randn(self.config.action_dim, device = device)
         return action.clamp(-1, 1)
-
-
+    
     @torch.no_grad()
     def estimate_value(self, z: Tensor, actions: Tensor) -> Tensor:
         """Estimates the value of a trajectory as per eqn 4 of the FOWM paper."""
@@ -203,7 +193,6 @@ class TDMPC2Policy(nn.Module):
         q1, q2 = math.two_hot_inv(q1, self.config), math.two_hot_inv(q2, self.config)
         q = (q1 + q2) / 2
         return G + running_discount * q
-
 
     def forward(self, batch: dict[str, Tensor]):
         device = get_device_from_parameters(self)
@@ -237,7 +226,7 @@ class TDMPC2Policy(nn.Module):
             pi = self.model.pi(z_targets)[0]
             q_targets = self.model.Qs_target(z_targets, pi)
             q1_target, q2_target = q_targets[np.random.choice(self.config.num_Qs, 2, replace=False)]
-            q1_target, q2_target = math_utils.two_hot_inv(q1_target, self.config), math_utils.two_hot_inv(q2_target, self.config)
+            q1_target, q2_target = math.two_hot_inv(q1_target, self.config), math.two_hot_inv(q2_target, self.config)
             q_targets = reward + TDMPC2Policy._discount_factor(self.config) * torch.min(q1_target, q2_target)
 
         # Compute losses.
@@ -261,7 +250,7 @@ class TDMPC2Policy(nn.Module):
         reward_loss = (
             (
                 temporal_loss_coeffs
-                * math_utils.ce_loss(reward_preds, math_utils.two_hot(reward, self.config)).mean(dim=-1)
+                * math.ce_loss(reward_preds, math.two_hot(reward, self.config)).mean(dim=-1)
             )
             .sum(0)
             .mean()
@@ -271,7 +260,7 @@ class TDMPC2Policy(nn.Module):
         q_value_loss = (
             (
                 temporal_loss_coeffs.repeat(self.config.num_Qs, 1)
-                * math_utils.ce_loss(q_preds, math_utils.two_hot(q_targets, self.config).unsqueeze(0).expand(5, -1, -1, -1)).mean(dim=-1).view(self.config.num_Qs * horizon, -1)
+                * math.ce_loss(q_preds, math.two_hot(q_targets, self.config).unsqueeze(0).expand(5, -1, -1, -1)).mean(dim=-1).view(self.config.num_Qs * horizon, -1)
             )
             .sum(0)
             .mean()
