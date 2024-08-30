@@ -67,6 +67,12 @@ class TDMPC2Config:
     reward_coeff: float = 0.1
     q_value_coeff: float = 0.1
 
+    # Training
+    training_steps: int = 1_000_0000
+    training_batch_size: int = 256
+    buffer_seed_size: int = 2500
+    buffer_capacity: int = 1_000_000
+
 class TDMPC2Policy(nn.Module):
     def __init__(self, config: TDMPC2Config):
         super().__init__()
