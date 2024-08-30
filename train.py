@@ -6,7 +6,7 @@ import torch
 from buffer import Buffer
 from env_dm_control import make_env
 from tdmpc2 import TDMPC2Policy, TDMPC2Config
-from utils import set_global_seed
+from utils import get_device_from_parameters, set_global_seed
 
 def to_episode_info(env, observation, action = None, reward = None):
     """Creates a TensorDict for a new episode."""
@@ -31,6 +31,8 @@ def train(
     buffer,
     policy,
 ):
+    device = get_device_from_parameters(policy)
+    
     policy.train()
 
     step = 0
@@ -49,8 +51,7 @@ def train(
             collected_episode_info = [to_episode_info(env, observation)]
 
         if step > config.buffer_seed_size:
-            action = env.rand_act()
-            # action = policy.select_action(observation)
+            action = policy.select_action(observation.unsqueeze(0).to(device)).cpu()
         else:
             action = env.rand_act()
         observation, reward, episode_done, info = env.step(action)
@@ -68,29 +69,20 @@ def train(
             iters = 1
         
         for _ in range(iters):
-            pass
+            sampled_observations, sampled_actions, sampled_reward, _ = buffer.sample()
+            batch = {
+                "observations": sampled_observations,
+                "actions": sampled_actions,
+                "reward": sampled_reward,
+            }
+            # policy(batch)
 
         if iters > 1:
             print("training with seed data... ", step)
         else:
             print("training with new data... ", step)
 
-        step += 1
-
-
-
-    batch = {
-        "observations": torch.randn(4, 256, 51),
-        "actions": torch.randn(3, 256, 19),
-        "reward": torch.randn(3, 256, 1)
-    } 
-
-    # dict = torch.load("./cup-spin.pt")["metadata"]
-    # print(dict)
-    config = TDMPC2Config()
-    policy = TDMPC2Policy(config = config)
-    policy.load("./cup-spin.pt")
-    # policy(batch)    
+        step += 1  
 
 def main():
     out_dir = f"outputs/train/{dt.now().strftime('%Y-%m-%d/%H-%M-%S')}"
