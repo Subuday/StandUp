@@ -10,7 +10,7 @@ import torch.nn.functional as F
 from torch import Tensor
 from functorch import combine_state_for_ensemble
 
-from common import math
+from common import math, init
 from utils import get_device_from_parameters
 
 @dataclass
@@ -294,6 +294,11 @@ class TDMPC2TOLD(nn.Module):
             NormedLinear(config.mlp_hidden_dim, config.mlp_hidden_dim, act = nn.Mish(inplace = True)),
             nn.Linear(config.mlp_hidden_dim, config.num_bins)
         )
+        self._pi = nn.Sequential(
+            NormedLinear(config.latent_dim, config.mlp_hidden_dim, act = nn.Mish(inplace = True)),
+            NormedLinear(config.mlp_hidden_dim, config.mlp_hidden_dim, act = nn.Mish(inplace = True)),
+            nn.Linear(config.mlp_hidden_dim, 2 * config.action_dim, bias = True)
+        )
         self._Qs = VectorizedModuleList([
             nn.Sequential(
                 NormedLinear(config.latent_dim + config.action_dim, config.mlp_hidden_dim, act = nn.Mish(inplace = True), dropout = 0.01),
@@ -302,12 +307,10 @@ class TDMPC2TOLD(nn.Module):
             )
             for _ in range(config.num_Qs)
         ])
+        self.apply(init.weight_init)
+        init.zero_([self._reward[-1].weight, self._Qs.params[-2]])
+
         self._Qs_target = copy.deepcopy(self._Qs).requires_grad_(False)
-        self._pi = nn.Sequential(
-            NormedLinear(config.latent_dim, config.mlp_hidden_dim, act = nn.Mish(inplace = True)),
-            NormedLinear(config.mlp_hidden_dim, config.mlp_hidden_dim, act = nn.Mish(inplace = True)),
-            nn.Linear(config.mlp_hidden_dim, 2 * config.action_dim, bias = True)
-        )
 
     def encode(self, observation: Tensor) -> Tensor:
         return self._encoder(observation)
