@@ -11,6 +11,7 @@ from torch import Tensor
 from functorch import combine_state_for_ensemble
 
 from common import math, init
+from common.scale import RunningScale
 from utils import get_device_from_parameters
 
 @dataclass
@@ -72,12 +73,25 @@ class TDMPC2Config:
     training_batch_size: int = 256
     buffer_seed_size: int = 10
     buffer_capacity: int = 10
+    grad_clip_norm: float = 20.0
+    lr: float = 3e-4
+    encoder_lr: float = 0.3
+    tau: float = 0.01
+    entropy_coeff: float = 1e-4
 
 class TDMPC2Policy(nn.Module):
     def __init__(self, config: TDMPC2Config):
         super().__init__()
         self.config = config
         self.model = TDMPC2TOLD(config = config)
+        self.model_optim = torch.optim.Adam([
+			{'params': self.model._encoder.parameters(), 'lr': self.config.lr * self.config.encoder_lr},
+			{'params': self.model._dynamics.parameters()},
+			{'params': self.model._reward.parameters()},
+			{'params': self.model._Qs.parameters()},
+		], lr=self.config.lr)
+        self.pi_optim = torch.optim.Adam(self.model._pi.parameters(), lr = self.config.lr, eps = 1e-5)
+        self.scale = RunningScale(config.tau)
         self.reset()
 
     @staticmethod
@@ -199,6 +213,36 @@ class TDMPC2Policy(nn.Module):
         q1, q2 = math.two_hot_inv(q1, self.config), math.two_hot_inv(q2, self.config)
         q = (q1 + q2) / 2
         return G + running_discount * q
+    
+    def _set_Qs_requires_grad(self, requires_grad: bool):
+        for p in self.model._Qs.parameters():
+            p.requires_grad_(requires_grad)
+    
+    def _update_pi(self, zs):
+        device = get_device_from_parameters(self)
+
+        self.pi_optim.zero_grad(set_to_none=True)
+        self._set_Qs_requires_grad(False)
+
+        pis, log_pis, _, _ = self.model.pi(zs)
+        qs = self.model.Qs(zs, pis)
+        qs1, qs2 = qs[np.random.choice(self.config.num_Qs, 2, replace=False)]
+        qs1, qs2 = math.two_hot_inv(qs1, self.config), math.two_hot_inv(qs2, self.config)
+        qs = (qs1 + qs2) / 2
+        
+        self.scale.update(qs[0])
+        qs = self.scale(qs)
+
+        # Loss is a weighted sum of Q-values
+        rho = torch.pow(self.config.temporal_decay_coeff, torch.arange(len(qs), device = device))
+        pi_loss = ((self.config.entropy_coeff * log_pis - qs).mean(dim=(1,2)) * rho).mean()
+        
+        pi_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.model._pi.parameters(), self.config.grad_clip_norm)
+        self.pi_optim.step()
+        self._set_Qs_requires_grad(True)
+
+        return pi_loss
 
     def forward(self, batch: dict[str, Tensor]):
         device = get_device_from_parameters(self)
@@ -211,6 +255,18 @@ class TDMPC2Policy(nn.Module):
 
         horizon, batch_size = next_observations.shape[:2]
         
+        # Compute various targets with stopgrad.
+        with torch.no_grad():
+            # Latent state consistency targets.
+            z_targets = self.model.encode(next_observations)
+            pi = self.model.pi(z_targets)[0]
+            q_targets = self.model.Qs_target(z_targets, pi)
+            q1_target, q2_target = q_targets[np.random.choice(self.config.num_Qs, 2, replace=False)]
+            q1_target, q2_target = math.two_hot_inv(q1_target, self.config), math.two_hot_inv(q2_target, self.config)
+            q_targets = reward + TDMPC2Policy._discount_factor(self.config) * torch.min(q1_target, q2_target)
+
+        self.model_optim.zero_grad(set_to_none=True)
+
         # Run latent rollout using the latent dynamics model and policy model.
         # Note this has shape `horizon+1` because there are `horizon` actions and a current `z`. Each action
         # gives us a next `z`.
@@ -225,15 +281,6 @@ class TDMPC2Policy(nn.Module):
         # Compute Q predictions based on the latent rollout.
         q_preds = self.model.Qs(z_preds[:-1], actions)
 
-        # Compute various targets with stopgrad.
-        with torch.no_grad():
-            # Latent state consistency targets.
-            z_targets = self.model.encode(next_observations)
-            pi = self.model.pi(z_targets)[0]
-            q_targets = self.model.Qs_target(z_targets, pi)
-            q1_target, q2_target = q_targets[np.random.choice(self.config.num_Qs, 2, replace=False)]
-            q1_target, q2_target = math.two_hot_inv(q1_target, self.config), math.two_hot_inv(q2_target, self.config)
-            q_targets = reward + TDMPC2Policy._discount_factor(self.config) * torch.min(q1_target, q2_target)
 
         # Compute losses.
         # Exponentially decay the loss weight with respect to the timestep. Steps that are more distant in the
@@ -281,6 +328,29 @@ class TDMPC2Policy(nn.Module):
             + self.config.q_value_coeff * q_value_loss
         )
 
+        # Update model
+        loss.backward()
+        grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.grad_clip_norm)
+        self.model_optim.step()
+
+        # Update policy
+        pi_loss = self._update_pi(z_preds.detach())
+
+        # Update target Q-functions
+        with torch.no_grad():
+            for p, p_target in zip(self.model._Qs.parameters(), self.model._Qs_target.parameters()):
+                p_target.data.lerp_(p.data, self.config.tau)
+
+        return {
+			"loss": loss.item(),
+			"consistency_loss": consistency_loss.item(),
+			"reward_loss": reward_loss.item(),
+			"value_loss": q_value_loss.item(),
+			"pi_loss": pi_loss.item(),
+			"grad_norm": grad_norm.item(),
+			"scale": self.scale.value,
+        }
+
 
 class TDMPC2TOLD(nn.Module):
     def __init__(self, config: TDMPC2Config):
@@ -314,6 +384,11 @@ class TDMPC2TOLD(nn.Module):
         init.zero_([self._reward[-1].weight, self._Qs.params[-2]])
 
         self._Qs_target = copy.deepcopy(self._Qs).requires_grad_(False)
+
+    def train(self, mode = True):
+        super().train(mode)
+        self._Qs_target.train(False)
+        return self
 
     def encode(self, observation: Tensor) -> Tensor:
         return self._encoder(observation)

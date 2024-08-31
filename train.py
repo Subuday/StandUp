@@ -32,8 +32,6 @@ def train(
     policy,
 ):
     device = get_device_from_parameters(policy)
-    
-    policy.train()
 
     step = 0
     collected_episode_info = []
@@ -41,6 +39,8 @@ def train(
     while True:
         if step == config.training_steps:
             break
+
+        policy.eval()
 
         if episode_done:
             if len(collected_episode_info) > 0:
@@ -68,6 +68,7 @@ def train(
         else:
             iters = 1
         
+        policy.train()
         for _ in range(iters):
             sampled_observations, sampled_actions, sampled_reward, _ = buffer.sample()
             batch = {
@@ -75,7 +76,7 @@ def train(
                 "actions": sampled_actions,
                 "reward": sampled_reward,
             }
-            # policy(batch)
+            policy(batch)
 
         if iters > 1:
             print("training with seed data... ", step)
