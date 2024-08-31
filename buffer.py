@@ -67,7 +67,7 @@ class Buffer():
 	def _to_device(self, *args, device=None):
 		if device is None:
 			device = self._device
-		return (arg.to(device, non_blocking=True) \
+		return (arg.to(device) \
 			if arg is not None else None for arg in args)
 
 	def _prepare_batch(self, td):

@@ -348,7 +348,7 @@ class TDMPC2Policy(nn.Module):
 			"loss": loss.item(),
 			"consistency_loss": consistency_loss.item(),
 			"reward_loss": reward_loss.item(),
-			"value_loss": q_value_loss.item(),
+			"q_value_loss": q_value_loss.item(),
 			"pi_loss": pi_loss.item(),
 			"grad_norm": grad_norm.item(),
 			"scale": self.scale.value,

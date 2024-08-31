@@ -56,10 +56,8 @@ def train(
             action = policy.select_action(observation.unsqueeze(0).to(device)).cpu()
         else:
             action = env.rand_act()
-        observation, reward, episode_done, info = env.step(action)
+        observation, reward, episode_done, _ = env.step(action)
         collected_episode_info.append(to_episode_info(env, observation, action, reward))
-            
-        print("Colllecting seed data... ", step)
 
         if step < config.buffer_seed_size:
             step += 1
@@ -78,12 +76,12 @@ def train(
                 "actions": sampled_actions,
                 "reward": sampled_reward,
             }
-            policy(batch)
-
-        if iters > 1:
-            print("training with seed data... ", step)
-        else:
-            print("training with new data... ", step)
+            train_info = policy(batch)
+            print("Step: ", step)
+            print("Loss: ", train_info["loss"])
+            print("Consistency loss: ", train_info["consistency_loss"])
+            print("Reward loss: ", train_info["reward_loss"])
+            print("Q value loss: ", train_info["q_value_loss"])
 
         step += 1
     
