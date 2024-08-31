@@ -1,4 +1,5 @@
 from datetime import datetime as dt
+from common.logger import Logger
 
 from tensordict import TensorDict
 import torch
@@ -30,6 +31,7 @@ def train(
     env,
     buffer,
     policy,
+    logger: Logger,
 ):
     device = get_device_from_parameters(policy)
 
@@ -83,11 +85,11 @@ def train(
         else:
             print("training with new data... ", step)
 
-        step += 1  
+        step += 1
+    
+    logger.save_checkpoint(identifier = dt.now().strftime('%H-%M-%S'), policy = policy)
 
 def main():
-    out_dir = f"outputs/train/{dt.now().strftime('%Y-%m-%d/%H-%M-%S')}"
-    
     config = TDMPC2Config()
     
     set_global_seed(config.seed)
@@ -98,7 +100,9 @@ def main():
 
     policy = TDMPC2Policy(config).to("mps")
 
-    train(config, env, buffer, policy)
+    logger = Logger(log_dir = "./out/")
+
+    train(config, env, buffer, policy, logger)
 
 if __name__ == "__main__":
     main()

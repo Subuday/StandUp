@@ -107,6 +107,9 @@ class TDMPC2Policy(nn.Module):
     def reset(self):
         self._prev_mean: torch.Tensor | None = None
 
+    def save(self, file_path: str):
+        torch.save({"model": self.model.state_dict()}, file_path)
+
     def load(self, file_path: str):
         dict = torch.load(file_path, weights_only=True)["model"]
         new_keys = []
