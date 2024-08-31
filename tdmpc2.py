@@ -69,10 +69,10 @@ class TDMPC2Config:
     q_value_coeff: float = 0.1
 
     # Training
-    training_steps: int = 1_000_0000
+    training_steps: int = 5_000_000
     training_batch_size: int = 256
-    buffer_seed_size: int = 10
-    buffer_capacity: int = 10
+    buffer_seed_size: int = 2500
+    buffer_capacity: int = 1_000_000
     grad_clip_norm: float = 20.0
     lr: float = 3e-4
     encoder_lr: float = 0.3
