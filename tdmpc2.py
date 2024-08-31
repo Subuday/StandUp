@@ -70,8 +70,8 @@ class TDMPC2Config:
     # Training
     training_steps: int = 1_000_0000
     training_batch_size: int = 256
-    buffer_seed_size: int = 2500
-    buffer_capacity: int = 1_000_000
+    buffer_seed_size: int = 10
+    buffer_capacity: int = 10
 
 class TDMPC2Policy(nn.Module):
     def __init__(self, config: TDMPC2Config):
@@ -256,7 +256,7 @@ class TDMPC2Policy(nn.Module):
         reward_loss = (
             (
                 temporal_loss_coeffs
-                * math.ce_loss(reward_preds, math.two_hot(reward, self.config)).mean(dim=-1)
+                * math.soft_ce(reward_preds, reward, self.config).mean(dim=-1)
             )
             .sum(0)
             .mean()
@@ -266,7 +266,10 @@ class TDMPC2Policy(nn.Module):
         q_value_loss = (
             (
                 temporal_loss_coeffs.repeat(self.config.num_Qs, 1)
-                * math.ce_loss(q_preds, math.two_hot(q_targets, self.config).unsqueeze(0).expand(5, -1, -1, -1)).mean(dim=-1).view(self.config.num_Qs * horizon, -1)
+                * math.soft_ce(
+                    q_preds, 
+                    einops.repeat(q_targets, 'h w c -> q h w c', q = q_preds.shape[0]
+                ), self.config).mean(dim=-1).view(self.config.num_Qs * horizon, -1)
             )
             .sum(0)
             .mean()
