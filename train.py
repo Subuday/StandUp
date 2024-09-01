@@ -7,7 +7,7 @@ import torch
 from buffer import Buffer
 from env_dm_control import make_env
 from tdmpc2 import TDMPC2Policy, TDMPC2Config
-from utils import get_device_from_parameters, set_global_seed
+from utils import get_device_from_config, get_device_from_parameters, set_global_seed
 
 def to_episode_info(env, observation, action = None, reward = None):
     """Creates a TensorDict for a new episode."""
@@ -85,6 +85,8 @@ def train(
 
 def main():
     config = TDMPC2Config()
+
+    device = get_device_from_config(config)
     
     set_global_seed(config.seed)
 
@@ -92,7 +94,7 @@ def main():
 
     buffer = Buffer(config)
 
-    policy = TDMPC2Policy(config).to("mps")
+    policy = TDMPC2Policy(config).to(device)
 
     logger = Logger(log_dir = f"./out/{dt.now().strftime('%Y-%m-%d/%H-%M-%S')}")
 

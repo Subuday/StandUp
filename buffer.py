@@ -12,7 +12,7 @@ class Buffer():
 
 	def __init__(self, cfg):
 		self.cfg = cfg
-		self._device = torch.device('mps')
+		self._device = torch.device(cfg.device)
 		self._capacity = min(cfg.buffer_capacity, cfg.training_steps)
 		self._sampler = SliceSampler(
 			num_slices=self.cfg.training_batch_size,

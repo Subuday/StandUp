@@ -18,6 +18,7 @@ from utils import get_device_from_parameters
 class TDMPC2Config:
     checkpoint: str = "./dog-run.pt"
     seed: int = 1
+    device = "mps"
 
     horizon: int = 3
     
@@ -103,6 +104,11 @@ class TDMPC2Policy(nn.Module):
         """
         frac = config.episode_length / config.discount_factor_denom
         return min(max((frac - 1) / (frac), config.discount_factor_min), config.discount_factor_max)
+    
+    def to(self, *args, **kwargs):
+        super().to(*args, **kwargs)
+        self.scale = self.scale.to(*args, **kwargs)
+        return self
     
     def reset(self):
         self._prev_mean: torch.Tensor | None = None

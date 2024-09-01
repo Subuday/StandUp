@@ -4,13 +4,22 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+def get_device_from_config(config) -> torch.device:
+    if config.device == "cuda":
+        assert torch.cuda.is_available()
+        return torch.device("cuda")
+    elif config.device == "mps":
+        assert torch.backends.mps.is_available()
+        return torch.device("mps")
+    else:
+        return torch.device("cpu")
+
 def get_device_from_parameters(module: nn.Module) -> torch.device:
     """Get a module's device by checking one of its parameters.
 
     Note: assumes that all parameters have the same device
     """
     return next(iter(module.parameters())).device
-
 
 def set_global_seed(seed):
     """Set seed for reproducibility."""
