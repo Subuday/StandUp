@@ -77,11 +77,7 @@ def train(
                 "reward": sampled_reward,
             }
             train_info = policy(batch)
-            print("Step: ", step)
-            print("Loss: ", train_info["loss"])
-            print("Consistency loss: ", train_info["consistency_loss"])
-            print("Reward loss: ", train_info["reward_loss"])
-            print("Q value loss: ", train_info["q_value_loss"])
+            logger.log_dict(train_info, step, mode = "train")
 
         step += 1
     
@@ -98,7 +94,7 @@ def main():
 
     policy = TDMPC2Policy(config).to("mps")
 
-    logger = Logger(log_dir = "./out/")
+    logger = Logger(log_dir = f"./out/{dt.now().strftime('%Y-%m-%d/%H-%M-%S')}")
 
     train(config, env, buffer, policy, logger)
 
