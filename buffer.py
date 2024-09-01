@@ -58,7 +58,7 @@ class Buffer():
 		total_bytes = bytes_per_step*self._capacity
 		print(f'Storage required: {total_bytes/1e9:.2f} GB')
 		# Heuristic: decide whether to use CUDA or CPU memory
-		storage_device = 'mps' # if 2.5*total_bytes < mem_free else 'cpu'
+		storage_device = self._device # if 2.5*total_bytes < mem_free else 'cpu'
 		print(f'Using {storage_device.upper()} memory for storage.')
 		return self._reserve_buffer(
 			LazyTensorStorage(self._capacity, device=torch.device(storage_device))
