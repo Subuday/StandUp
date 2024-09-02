@@ -16,7 +16,7 @@ from utils import get_device_from_parameters
 
 @dataclass
 class TDMPC2Config:
-    checkpoint: str = "./dog-run.pt"
+    checkpoint: str = "./19-54-16.pt"
     seed: int = 1
     device = "mps"
 
@@ -117,7 +117,7 @@ class TDMPC2Policy(nn.Module):
         torch.save({"model": self.model.state_dict()}, file_path)
 
     def load(self, file_path: str):
-        dict = torch.load(file_path, weights_only=True)["model"]
+        dict = torch.load(file_path, weights_only=False, map_location = "mps")["model"]
         new_keys = []
 
         for key in dict.keys():
